@@ -343,7 +343,7 @@ do_mount() {
             [ -z "$type" ] && { printf "${RED}[!] Invalid device: $full_dev${RESET}\n"; continue; }
             if [ "$type" = "disk" ]; then
                 local disk_name=$(basename "$full_dev")
-                mapfile -t parts < <(lsblk -l -r -o NAME,TYPE "$full_dev" 2>/dev/null | awk '$2=="part" {print "/dev/"$1}')
+                mapfile -t parts < <(lsblk -p -l -o NAME,TYPE "$full_dev" 2>/dev/null | awk '$2=="part" {print $1}')
                 [ ${#parts[@]} -eq 0 ] && { printf "${YELLOW}[!] No partitions on $full_dev.${RESET}\n"; continue; }
                 printf "${CYAN}[*] Disk $disk_name: mounting all partitions...${RESET}\n"
                 for part in "${parts[@]}"; do
