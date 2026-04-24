@@ -1,0 +1,976 @@
+#!/bin/bash
+# ====================================================================
+# sadm - Sadaptive Mount Manager v1.0 (The Keystone Release)
+# ====================================================================
+# Maintainer: rizkybayuu_
+# License: MIT
+# ====================================================================
+# - Check busy logic fixed: returns 1 if busy, 0 if free; calls use `!`
+# - Force flag (-f) never stored in memory; session files only "dev|mp"
+# - --s-list shows FS (filesystem) instead of FORCE
+# - Restore with -f forces mount even if device already mounted elsewhere
+# - Atomic session update using mount --move, no deadlock
+# ====================================================================
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# --- COLORS ---
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[93m'; BLUE='\033[34m'
+CYAN='\033[36m'; BOLD='\033[1m'; RESET='\033[0m'; ORANGE='\033[38;5;208m'
+PURPLE='\033[38;5;141m'; DARK_GRAY='\033[90m'
+LINE='────────────────────────────────────────────────────────────'
+
+# --- CONFIGURATION ---
+BASE_MNT="/sadm"
+NS_DIR="$BASE_MNT/ns"
+SESSION_PREFIX="$BASE_MNT/s"
+STATE_DIR="/var/lib/sadm"
+SESSION_COUNTER_FILE="$STATE_DIR/session_counter"
+SYNC_BACKUP_FILE="$STATE_DIR/sync_backup"
+SESSION_MEMORY_DIR="$STATE_DIR/sessions"
+mkdir -p "$STATE_DIR" "$SESSION_MEMORY_DIR" "$NS_DIR" 2>/dev/null
+
+# --- ROOT CHECK ---
+if [ "$EUID" -ne 0 ]; then
+    printf "${YELLOW}[!] Sadaptive Mount Manager requires root. Escalating...${RESET}\n"
+    sudo "$0" "$@"
+    exit $?
+fi
+
+# --- DEPENDENCY CHECK ---
+has_tool() { command -v "$1" >/dev/null 2>&1; }
+install_sadp() {
+    printf "${CYAN}[*] Installing sadp from GitHub...${RESET}\n"
+    local url="https://raw.githubusercontent.com/rizkybayuu/sadp/main/sadp"
+    local tmp=$(mktemp)
+    if sudo curl -fsSL -L -o "$tmp" "$url"; then
+        sudo install -m 755 "$tmp" /usr/local/sbin/sadp
+        rm -f "$tmp"
+        printf "${GREEN}[+] sadp installed.${RESET}\n"
+        return 0
+    fi
+    rm -f "$tmp"
+    printf "${RED}[!] Failed to install sadp.${RESET}\n"
+    return 1
+}
+confirm_install() {
+    local pkg="$1"
+    if has_tool "$pkg"; then return 0; fi
+    printf "\n${YELLOW}[!] $pkg not found. Install? (y/N): "
+    read -r ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        if ! has_tool sadp; then install_sadp || return 1; fi
+        sudo sadp install --yes "$pkg"
+        return $?
+    else
+        printf "${RED}[!] $pkg required. Exiting.${RESET}\n"
+        return 1
+    fi
+}
+check_dependencies() {
+    local missing=0
+    for dep in lsblk findmnt blkid fuser awk sed grep xargs sort cut tr head tail mount umount mkdir rmdir rm find curl; do
+        if ! has_tool "$dep"; then
+            printf "${RED}[!] Missing: $dep${RESET}\n"
+            missing=1
+        fi
+    done
+    if [ $missing -eq 1 ]; then
+        confirm_install "util-linux" || exit 1
+        confirm_install "psmisc" || exit 1
+        confirm_install "gawk" || exit 1
+        confirm_install "findutils" || exit 1
+        confirm_install "coreutils" || exit 1
+        confirm_install "curl" || exit 1
+        for dep in lsblk findmnt blkid fuser awk sed grep xargs sort cut tr head tail mount umount mkdir rmdir rm find curl; do
+            if ! has_tool "$dep"; then
+                printf "${RED}[!] Still missing: $dep. Abort.${RESET}\n"
+                exit 1
+            fi
+        done
+    fi
+}
+check_dependencies
+
+# --- SESSION LOGIC ---
+get_next_session_id() {
+    if [ -f "$SESSION_COUNTER_FILE" ]; then
+        local last=$(cat "$SESSION_COUNTER_FILE" | tr -d '\r')
+        echo $((last + 1))
+    else
+        echo 1
+    fi
+}
+update_session_counter() { echo "$1" > "$SESSION_COUNTER_FILE"; }
+clean_empty_dirs() { find "$BASE_MNT" -mindepth 1 -type d -empty -delete 2>/dev/null; }
+
+# --- SAFETY LOCK ---
+is_system_mount() {
+    local mp="$1"
+    if [[ "$mp" == /run/media/* || "$mp" == /media/* ]]; then return 1; fi
+    case "$mp" in
+        / | /boot* | /home* | /var* | /usr* | /dev* | /proc* | /sys* | /run* | /etc* | /opt* | /tmp* | /lib* | /bin* | /sbin*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- UTILITIES ---
+unescape_findmnt() { echo "$1" | sed 's/\\x20/ /g; s/\\x09/ /g; s/\\x5c/\\/g; s/\\x0a/\n/g'; }
+remove_from_backup() {
+    local dev="$1" mp="$2"
+    if [ -f "$SYNC_BACKUP_FILE" ]; then
+        awk -F'|' -v d="$dev" -v m="$mp" '$1!=d || $2!=m' "$SYNC_BACKUP_FILE" > "${SYNC_BACKUP_FILE}.tmp" && mv "${SYNC_BACKUP_FILE}.tmp" "$SYNC_BACKUP_FILE"
+    fi
+}
+get_fs_type() {
+    local dev="${1%%\[*}"
+    local fs=$(lsblk -no FSTYPE "$dev" 2>/dev/null | head -n1 | tr -d '\r' | xargs)
+    if [ "$fs" = "vfat" ]; then
+        local version=$(blkid -o udev "$dev" 2>/dev/null | grep '^ID_FS_VERSION=' | cut -d= -f2 | tr -d '\r')
+        if [ -n "$version" ]; then
+            fs="${version,,}"
+        else
+            version=$(blkid -s VERSION -o value "$dev" 2>/dev/null | tr -d '\r' | xargs)
+            [ -n "$version" ] && fs="${version,,}"
+        fi
+    fi
+    echo "$fs"
+}
+is_mounted() { findmnt -rn -S "$1" >/dev/null 2>&1 || mountpoint -q "$1" 2>/dev/null; }
+get_mount_opts() {
+    local fs="$1"
+    case "$fs" in
+        ntfs|ntfs3) echo "-t ntfs3 -o force" ;;
+        ufs|ufs2)   echo "-t ufs -o ufstype=ufs2" ;;
+        befs)       echo "-t befs" ;;
+        exfat)      echo "-t exfat" ;;
+        fat32|fat16|vfat) echo "-t vfat" ;;
+        *)          echo "" ;;
+    esac
+}
+normalize_dev() {
+    if [[ "$1" == /dev/* ]]; then echo "$1"; else echo "/dev/$1"; fi
+}
+
+# --- CHECK BUSY (returns 1 if busy, 0 if free) ---
+check_busy() {
+    local target="$1" pids=""
+    if [[ "$target" == /dev/* ]]; then
+        pids=$(fuser "$target" 2>/dev/null)
+    else
+        pids=$(fuser -m "$target" 2>/dev/null)
+    fi
+    if [ -n "$pids" ]; then
+        printf "${RED}[!] $target is busy. PIDs: $pids${RESET}\n"
+        for pid in $pids; do
+            local cmd=$(ps -p "$pid" -o comm= 2>/dev/null)
+            printf "    PID $pid: $cmd\n"
+        done
+        return 1   # busy
+    else
+        return 0   # free
+    fi
+}
+
+# --- DO CHECK (returns 1 if any busy found, 0 if all free) ---
+do_check() {
+    local target="$1"
+    if [ "$target" = "-a" ] || [ "$target" = "-all" ]; then
+        local any_busy=0
+        mapfile -t mounts < <(findmnt -rn -o TARGET 2>/dev/null | grep "^$BASE_MNT")
+        for mp in "${mounts[@]}"; do
+            if check_busy "$mp"; then any_busy=1; fi
+        done
+        return $any_busy
+    elif [[ "$target" == --s* ]]; then
+        local expr="${target#--s}"
+        [[ "$expr" =~ ^= ]] && expr="${expr#=}"
+        local parsed=$(parse_session_expr "$expr")
+        [ -z "$parsed" ] && { printf "${RED}[!] Invalid session expr: $expr${RESET}\n"; return 1; }
+        local op="${parsed%|*}" val="${parsed#*|}"
+        local any_busy=0
+        for sdir in "$BASE_MNT"/s[0-9]*; do
+            [ -d "$sdir" ] || continue
+            snum=${sdir##*/s}
+            if session_matches "$snum" "$op" "$val"; then
+                mapfile -t mounts < <(findmnt -rn -o TARGET 2>/dev/null | grep "^$sdir/")
+                for mp in "${mounts[@]}"; do
+                    if check_busy "$mp"; then any_busy=1; fi
+                done
+            fi
+        done
+        return $any_busy
+    else
+        if [[ "$target" == /dev/* ]] || [[ "$target" == /* ]]; then
+            check_busy "$target"
+            return $?
+        else
+            local dev="/dev/$target"
+            if is_mounted "$dev"; then
+                check_busy "$dev"
+                return $?
+            else
+                printf "${YELLOW}[!] $target not mounted.${RESET}\n"
+                return 0
+            fi
+        fi
+    fi
+}
+
+# --- GET BIND MOUNTS ---
+get_bind_mounts() {
+    local source_mp="$1"
+    awk -v src="$source_mp" '$1 == src && $2 != src {print $2}' /proc/mounts
+}
+
+# --- EXECUTE MOUNT (force uses bind mount) ---
+execute_mount() {
+    local dev="$1" mountpoint="$2" force="${3:-no}" interactive_dir_confirm="${4:-no}"
+    dev="${dev%%\[*}"
+    local fs=$(get_fs_type "$dev")
+    local opts=$(get_mount_opts "$fs")
+    [ -z "$fs" ] && { printf "${RED}[!] $dev has no filesystem.${RESET}\n"; return 1; }
+    if findmnt -rn -S "$dev" -o TARGET 2>/dev/null | grep -Fxq "$mountpoint"; then
+        printf "${YELLOW}[!] $dev already mounted exactly at $mountpoint. Skipping.${RESET}\n"
+        return 0
+    fi
+    if is_mounted "$dev"; then
+        if [ "$force" = "yes" ]; then
+            local existing=$(findmnt -rn -S "$dev" -o TARGET 2>/dev/null | head -n1)
+            printf "${YELLOW}[*] Force: bind mounting $dev from $existing to $mountpoint.${RESET}\n"
+            [ ! -d "$mountpoint" ] && { mkdir -p "$mountpoint" || { printf "${RED}[✘] mkdir failed.${RESET}\n"; return 1; }; }
+            if mount --bind "$existing" "$mountpoint" 2>/dev/null; then
+                printf "${GREEN}[✓] Success: $dev -> $mountpoint (bind)${RESET}\n"
+                return 0
+            else
+                printf "${RED}[✘] Bind mount failed.${RESET}\n"
+                return 1
+            fi
+        else
+            printf "${YELLOW}[!] $dev already mounted. Use -f to force.${RESET}\n"
+            return 0
+        fi
+    fi
+    [ ! -d "$mountpoint" ] && {
+        if [ "$interactive_dir_confirm" = "yes" ]; then
+            printf "${CYAN}Directory $mountpoint does not exist. Create? (y/N): "
+            local ans=""; read -t 30 -r ans < /dev/tty; echo ""
+            [[ ! "$ans" =~ ^[Yy]$ ]] && { printf "${RED}[✘] Cancelled.${RESET}\n"; return 1; }
+        fi
+        mkdir -p "$mountpoint" || { printf "${RED}[✘] mkdir failed.${RESET}\n"; return 1; }
+    }
+    printf "${BLUE}[*] Mounting $dev ($fs) to $mountpoint ...${RESET}\n"
+    local err_msg
+    err_msg=$(mount $opts "$dev" "$mountpoint" 2>&1)
+    if [ $? -eq 0 ]; then
+        printf "${GREEN}[✓] Success: $dev -> $mountpoint${RESET}\n"
+        return 0
+    else
+        printf "${RED}[✘] Failed: $err_msg${RESET}\n"
+        rmdir "$mountpoint" 2>/dev/null
+        return 1
+    fi
+}
+
+# --- MOUNT LOGIC ---
+do_mount() {
+    local devices=() targets=() force_devices=() session_id="" use_target=0 mount_success=0 do_all=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -mount|-m) shift ;;
+            -force|-f) shift
+                while [ $# -gt 0 ] && [[ "$1" != -* ]]; do
+                    force_devices+=("$1")
+                    local found=0
+                    for d in "${devices[@]}"; do
+                        [ "$(normalize_dev "$d")" = "$(normalize_dev "$1")" ] && { found=1; break; }
+                    done
+                    [ $found -eq 0 ] && devices+=("$1")
+                    shift
+                done ;;
+            -all|-a) do_all=1; shift ;;
+            --s) session_id=$(get_next_session_id); shift ;;
+            --t) use_target=1; shift
+                while [ $# -gt 0 ] && [[ "$1" != -* ]]; do
+                    if [[ "$1" != /* ]]; then printf "${RED}[!] Target must be absolute.${RESET}\n"; exit 1; fi
+                    targets+=("$1"); shift
+                done ;;
+            -*) printf "${RED}[!] Unknown flag: $1${RESET}\n"; exit 1 ;;
+            *) devices+=("$1"); shift ;;
+        esac
+    done
+    [ $do_all -eq 1 ] && { do_mount_all "$session_id"; return; }
+    [ ${#devices[@]} -eq 0 ] && { printf "${RED}[!] No devices.${RESET}\n"; return 1; }
+    local base_dir
+    if [ -n "$session_id" ]; then
+        base_dir="$SESSION_PREFIX$session_id"
+        mkdir -p "$SESSION_MEMORY_DIR"
+        local mem_file="$SESSION_MEMORY_DIR/s_${session_id}.list"
+    else
+        base_dir="$NS_DIR"
+    fi
+    if [ $use_target -eq 1 ]; then
+        local num_dev=${#devices[@]} num_tgt=${#targets[@]}
+        [ $num_tgt -gt $num_dev ] && { printf "${RED}[!] Too many targets.${RESET}\n"; return 1; }
+        for i in "${!devices[@]}"; do
+            dev=$(normalize_dev "${devices[$i]}")
+            if [ $i -lt $num_tgt ]; then mp="${targets[$i]}"
+            else
+                while true; do
+                    printf "Mountpoint for $dev: "; read -r mp < /dev/tty
+                    [ -z "$mp" ] && { printf "${RED}Cancelled.${RESET}\n"; return 1; }
+                    [[ "$mp" == /* ]] && break
+                    printf "${YELLOW}Absolute path required.${RESET}\n"
+                done
+            fi
+            force="no"
+            for fd in "${force_devices[@]}"; do
+                [ "$(normalize_dev "$fd")" = "$(normalize_dev "${devices[$i]}")" ] && { force="yes"; break; }
+            done
+            if execute_mount "$dev" "$mp" "$force" "yes"; then
+                mount_success=1
+                [ -n "$session_id" ] && echo "$dev|$mp" >> "$SESSION_MEMORY_DIR/s_${session_id}.list"
+            fi
+        done
+    else
+        for dev_item in "${devices[@]}"; do
+            full_dev=$(normalize_dev "$dev_item")
+            force="no"
+            for fd in "${force_devices[@]}"; do
+                [ "$(normalize_dev "$fd")" = "$(normalize_dev "$dev_item")" ] && { force="yes"; break; }
+            done
+            local type=$(lsblk -no TYPE "$full_dev" 2>/dev/null | head -n1 | xargs)
+            [ -z "$type" ] && { printf "${RED}[!] Invalid device: $full_dev${RESET}\n"; continue; }
+            if [ "$type" = "disk" ]; then
+                local disk_name=$(basename "$full_dev")
+                mapfile -t parts < <(lsblk -l -r -o NAME,TYPE "$full_dev" 2>/dev/null | awk '$2=="part" {print "/dev/"$1}')
+                [ ${#parts[@]} -eq 0 ] && { printf "${YELLOW}[!] No partitions on $full_dev.${RESET}\n"; continue; }
+                printf "${CYAN}[*] Disk $disk_name: mounting all partitions...${RESET}\n"
+                for part in "${parts[@]}"; do
+                    part_name=$(basename "$part")
+                    target="$base_dir/$disk_name/$part_name"
+                    if execute_mount "$part" "$target" "$force" "no"; then
+                        mount_success=1
+                        [ -n "$session_id" ] && echo "$part|$target" >> "$SESSION_MEMORY_DIR/s_${session_id}.list"
+                    fi
+                done
+            elif [ "$type" = "part" ]; then
+                local parent_disk=$(lsblk -no PKNAME "$full_dev" 2>/dev/null | head -n1 | xargs)
+                part_name=$(basename "$full_dev")
+                [ -z "$parent_disk" ] && target="$base_dir/$part_name" || target="$base_dir/$parent_disk/$part_name"
+                if execute_mount "$full_dev" "$target" "$force" "no"; then
+                    mount_success=1
+                    [ -n "$session_id" ] && echo "$full_dev|$target" >> "$SESSION_MEMORY_DIR/s_${session_id}.list"
+                fi
+            else
+                printf "${RED}[!] $full_dev bukan disk/part.${RESET}\n"
+            fi
+        done
+    fi
+    [ -n "$session_id" ] && [ $mount_success -eq 1 ] && update_session_counter "$session_id"
+    clean_empty_dirs
+}
+
+do_mount_all() {
+    local session_id="$1"
+    printf "${YELLOW}[*] Mounting ALL unmounted partitions...${RESET}\n"
+    mapfile -t all_parts < <(lsblk -l -o NAME,TYPE -p 2>/dev/null | awk '$2=="part" {print $1}')
+    if [ -n "$session_id" ]; then
+        local base_dir="$SESSION_PREFIX$session_id"
+        mkdir -p "$SESSION_MEMORY_DIR"
+        local mem_file="$SESSION_MEMORY_DIR/s_${session_id}.list"
+        local any_success=0
+        for part in "${all_parts[@]}"; do
+            if ! is_mounted "$part"; then
+                parent_disk=$(lsblk -no PKNAME "$part" 2>/dev/null | head -n1 | xargs)
+                part_name=$(basename "$part")
+                [ -n "$parent_disk" ] && target="$base_dir/$parent_disk/$part_name" || target="$base_dir/$part_name"
+                if execute_mount "$part" "$target" "no" "no"; then
+                    any_success=1
+                    echo "$part|$target" >> "$mem_file"
+                fi
+            fi
+        done
+        [ $any_success -eq 1 ] && update_session_counter "$session_id"
+    else
+        local any_success=0
+        for part in "${all_parts[@]}"; do
+            if ! is_mounted "$part"; then
+                parent_disk=$(lsblk -no PKNAME "$part" 2>/dev/null | head -n1 | xargs)
+                part_name=$(basename "$part")
+                [ -n "$parent_disk" ] && target="$NS_DIR/$parent_disk/$part_name" || target="$NS_DIR/$part_name"
+                if execute_mount "$part" "$target" "no" "no"; then any_success=1; fi
+            fi
+        done
+        [ $any_success -eq 0 ] && printf "${YELLOW}[!] No new mounts.${RESET}\n"
+    fi
+    clean_empty_dirs
+}
+
+# --- UNMOUNT LOGIC ---
+do_unmount_single() {
+    local target="$1" force_lazy="$2" dev="" mnt=""
+    if [[ "$target" == /dev/* ]]; then
+        dev="$target"
+        mnt=$(findmnt -rn -S "$dev" -o TARGET 2>/dev/null | head -n1)
+        [ -n "$mnt" ] && { local bind_mounts=$(get_bind_mounts "$mnt"); for bm in $bind_mounts; do do_unmount_single "$bm" "$force_lazy"; done; }
+    elif [[ "$target" == /* ]]; then
+        mnt="$target"
+        dev=$(findmnt -rn -T "$mnt" -o SOURCE 2>/dev/null | head -n1)
+        dev="${dev%%\[*}"
+    else
+        dev="/dev/$target"
+        mnt=$(findmnt -rn -S "$dev" -o TARGET 2>/dev/null | head -n1)
+        [ -n "$mnt" ] && { local bind_mounts=$(get_bind_mounts "$mnt"); for bm in $bind_mounts; do do_unmount_single "$bm" "$force_lazy"; done; }
+    fi
+    mnt=$(unescape_findmnt "$mnt")
+    dev="${dev%%\[*}"
+    [ -n "$mnt" ] && is_system_mount "$mnt" && { printf "${RED}[!] Safety: Cannot unmount system $mnt.${RESET}\n"; return 1; }
+    local unmount_target="${mnt:-$dev}"
+    [ -z "$unmount_target" ] && { printf "${RED}[!] Cannot find mountpoint.${RESET}\n"; return 1; }
+    if umount "$unmount_target" 2>/dev/null; then
+        printf "${GREEN}[✓] Unmounted: $unmount_target${RESET}\n"
+        rmdir "$unmount_target" 2>/dev/null
+        return 0
+    else
+        if mountpoint -q "$unmount_target" 2>/dev/null || is_mounted "$unmount_target"; then
+            printf "${YELLOW}[!] $unmount_target is busy.${RESET}\n"
+            if [ "$force_lazy" = "yes" ]; then
+                printf "${YELLOW}[*] Force lazy unmount...${RESET}\n"
+                umount -l "$unmount_target" 2>/dev/null && { printf "${GREEN}[✓] Lazy unmounted.${RESET}\n"; rmdir "$unmount_target" 2>/dev/null; return 0; } || { printf "${RED}[✘] Failed.${RESET}\n"; return 1; }
+            else
+                printf "${CYAN}Lazy unmount? (y/N, 10s): " && read -t 10 -r ans < /dev/tty && echo ""
+                [[ "$ans" =~ ^[Yy]$ ]] && { umount -l "$unmount_target" 2>/dev/null && { printf "${GREEN}[✓] Lazy unmounted.${RESET}\n"; rmdir "$unmount_target" 2>/dev/null; return 0; } || { printf "${RED}[✘] Failed.${RESET}\n"; return 1; }; } || { printf "${RED}[✘] Cancelled.${RESET}\n"; return 1; }
+            fi
+        else
+            printf "${RED}[✘] Unmount failed (not mounted).${RESET}\n"
+            return 1
+        fi
+    fi
+}
+do_unmount() {
+    local target="$1" session_id="$2" force_lazy="$3"
+    if [ -n "$session_id" ]; then
+        local session_dir="$SESSION_PREFIX$session_id"
+        if [ -d "$session_dir" ]; then
+            printf "${YELLOW}[*] Unmounting session $session_id...${RESET}\n"
+            mapfile -t session_mounts < <(findmnt -rn -o TARGET 2>/dev/null | grep "^$session_dir/" | awk '{print length($0), $0}' | sort -rn | cut -d' ' -f2-)
+            for mnt in "${session_mounts[@]}"; do mountpoint -q "$mnt" 2>/dev/null && do_unmount_single "$mnt" "$force_lazy"; done
+            rmdir "$session_dir" 2>/dev/null
+            rm -f "$SESSION_MEMORY_DIR/s_${session_id}.list" 2>/dev/null
+        else
+            printf "${RED}[!] Session $session_id not found.${RESET}\n"
+        fi
+        clean_empty_dirs
+        return
+    fi
+    [ -n "$target" ] && {
+        [[ "$target" != /* ]] && [[ "$target" != */* ]] && target="/dev/$target"
+        if [[ "$target" == /dev/* ]]; then
+            mapfile -t mnts < <(findmnt -rn -S "$target" -o TARGET 2>/dev/null)
+            [ ${#mnts[@]} -eq 0 ] && printf "${RED}[!] $target not mounted.${RESET}\n" || {
+                for mnt in "${mnts[@]}"; do
+                    mnt=$(unescape_findmnt "$mnt")
+                    local bind_mounts=$(get_bind_mounts "$mnt")
+                    for bm in $bind_mounts; do do_unmount_single "$bm" "$force_lazy"; done
+                    do_unmount_single "$mnt" "$force_lazy"
+                done
+            }
+        else
+            do_unmount_single "$target" "$force_lazy"
+        fi
+    }
+    clean_empty_dirs
+}
+do_unmount_all() {
+    printf "${RED}[!] Unmounting ALL mounts under $BASE_MNT ...${RESET}\n"
+    mapfile -t all_mounts < <(findmnt -rn -o TARGET 2>/dev/null | grep "^$BASE_MNT" | awk '{print length($0), $0}' | sort -rn | cut -d' ' -f2-)
+    for mnt in "${all_mounts[@]}"; do mountpoint -q "$mnt" 2>/dev/null && do_unmount_single "$mnt" "no"; done
+    clean_empty_dirs
+}
+
+# --- LIST LOGIC ---
+do_list() {
+    local show_all=0
+    [ "$1" = "-a" ] || [ "$1" = "-all" ] && show_all=1
+    local external_entries=() non_session_entries=() session_entries=()
+    mapfile -t dev_names < <(lsblk -rno NAME 2>/dev/null | grep -v "^loop")
+    for name in "${dev_names[@]}"; do
+        local dev="/dev/$name"
+        local fs=$(get_fs_type "$dev")
+        [ -z "$fs" ] && continue
+        mapfile -t mnts < <(findmnt -rn -S "$dev" -o TARGET 2>/dev/null)
+        if [ ${#mnts[@]} -eq 0 ]; then
+            [ $show_all -eq 1 ] && external_entries+=("UNMOUNTED|$dev||$fs")
+            continue
+        fi
+        for mp in "${mnts[@]}"; do
+            mp=$(unescape_findmnt "$mp")
+            if [[ "$mp" == "$BASE_MNT"* ]]; then
+                if [[ "$mp" =~ $BASE_MNT/s([0-9]+)(/|$) ]]; then
+                    sess_num="${BASH_REMATCH[1]}"
+                    session_entries+=("$sess_num|$dev|$mp|$fs")
+                else
+                    non_session_entries+=("$dev|$mp|$fs")
+                fi
+            else
+                if is_system_mount "$mp"; then
+                    external_entries+=("SYSTEM|$dev|$mp|$fs")
+                else
+                    external_entries+=("EXTERNAL|$dev|$mp|$fs")
+                fi
+            fi
+        done
+    done
+    printf "${CYAN}${BOLD}[*] SADM MOUNT LIST:${RESET}\n"
+    if [ ${#external_entries[@]} -gt 0 ]; then
+        printf "\n${PURPLE}${BOLD}  [ External ]${RESET}\n"
+        printf "%-15s %-45s %-10s\n" "DEVICE" "MOUNTPOINT" "FS"; echo "$LINE"
+        for entry in "${external_entries[@]}"; do
+            type=$(echo "$entry" | cut -d'|' -f1)
+            dev=$(echo "$entry" | cut -d'|' -f2)
+            mp=$(echo "$entry" | cut -d'|' -f3)
+            fs=$(echo "$entry" | cut -d'|' -f4)
+            if [ "$type" = "UNMOUNTED" ]; then
+                printf "${RED}%-15s %-45s %-10s${RESET}\n" "$dev" "(unmounted)" "$fs"
+            elif [ "$type" = "SYSTEM" ]; then
+                printf "${ORANGE}%-15s %-45s %-10s${RESET}\n" "$dev" "$mp" "$fs"
+            else
+                printf "${YELLOW}%-15s %-45s %-10s${RESET}\n" "$dev" "$mp" "$fs"
+            fi
+        done
+    fi
+    if [ ${#non_session_entries[@]} -gt 0 ]; then
+        printf "\n${PURPLE}${BOLD}  [ Non-Session Mounts ]${RESET}\n"
+        printf "%-15s %-45s %-10s\n" "DEVICE" "MOUNTPOINT" "FS"; echo "$LINE"
+        for entry in "${non_session_entries[@]}"; do
+            dev=$(echo "$entry" | cut -d'|' -f1)
+            mp=$(echo "$entry" | cut -d'|' -f2)
+            fs=$(echo "$entry" | cut -d'|' -f3)
+            printf "${GREEN}%-15s %-45s %-10s${RESET}\n" "$dev" "$mp" "$fs"
+        done
+    fi
+    if [ ${#session_entries[@]} -gt 0 ]; then
+        local sess_nums=()
+        for entry in "${session_entries[@]}"; do
+            sess=$(echo "$entry" | cut -d'|' -f1)
+            [[ ! " ${sess_nums[*]} " =~ " ${sess} " ]] && sess_nums+=("$sess")
+        done
+        mapfile -t sorted_sessions < <(printf "%s\n" "${sess_nums[@]}" | sort -n)
+        for sess in "${sorted_sessions[@]}"; do
+            printf "\n${PURPLE}${BOLD}  [ Session $sess ]${RESET}\n"
+            printf "%-15s %-45s %-10s\n" "DEVICE" "MOUNTPOINT" "FS"; echo "$LINE"
+            for entry in "${session_entries[@]}"; do
+                entry_sess=$(echo "$entry" | cut -d'|' -f1)
+                [ "$entry_sess" != "$sess" ] && continue
+                dev=$(echo "$entry" | cut -d'|' -f2)
+                mp=$(echo "$entry" | cut -d'|' -f3)
+                fs=$(echo "$entry" | cut -d'|' -f4)
+                printf "${GREEN}%-15s %-45s %-10s${RESET}\n" "$dev" "$mp" "$fs"
+            done
+        done
+    fi
+    echo ""
+}
+
+# --- SYNC & USYNC (ringkas) ---
+do_sync() {
+    printf "${YELLOW}[*] Relocating external mounts to $NS_DIR ...${RESET}\n"
+    touch "$SYNC_BACKUP_FILE"
+    local sorted_mounts=$(findmnt -rn -o SOURCE,TARGET,FSTYPE,OPTIONS 2>/dev/null | awk '{print length($2), $0}' | sort -rn | cut -d' ' -f2-)
+    while read -r dev mp fs opts rest; do
+        if [[ "$dev" == /dev/* ]] && [[ "$dev" != /dev/loop* ]]; then
+            mp=$(unescape_findmnt "$mp")
+            dev="${dev%%\[*}"
+            if [[ "$mp" != "$BASE_MNT"* ]] && ! is_system_mount "$mp"; then
+                parent_disk=$(lsblk -no PKNAME "$dev" 2>/dev/null | head -n1 | xargs)
+                part_name=$(basename "$dev")
+                [ -n "$parent_disk" ] && target_mnt="$NS_DIR/$parent_disk/$part_name" || target_mnt="$NS_DIR/$part_name"
+                mountpoint -q "$target_mnt" 2>/dev/null && target_mnt="${target_mnt}_$(basename "$mp" | sed 's/^\.//')"
+                remove_from_backup "$dev" "$mp"
+                echo "$dev|$mp|$target_mnt|$opts" >> "$SYNC_BACKUP_FILE"
+                printf "${BLUE}[*] Relocating $dev from $mp to $target_mnt...${RESET}\n"
+                if umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null; then
+                    mkdir -p "$target_mnt"
+                    if ! mount -o "$opts" "$dev" "$target_mnt" 2>/dev/null; then
+                        printf "${RED}[✘] Remount failed. Rolling back.${RESET}\n"
+                        mount -o "$opts" "$dev" "$mp" 2>/dev/null
+                        remove_from_backup "$dev" "$mp"
+                    fi
+                else
+                    printf "${RED}[!] Cannot unmount $mp. Skipping.${RESET}\n"
+                    remove_from_backup "$dev" "$mp"
+                fi
+            fi
+        fi
+    done <<< "$sorted_mounts"
+    clean_empty_dirs
+    printf "${GREEN}[+] Sync completed. Backup saved to $SYNC_BACKUP_FILE${RESET}\n"
+}
+do_usync() {
+    if [ ! -s "$SYNC_BACKUP_FILE" ]; then
+        printf "${RED}[!] No sync backup. Run '--sync' first.${RESET}\n"
+        return 1
+    fi
+    printf "${YELLOW}[*] Restoring original mountpoints...${RESET}\n"
+    mapfile -t backup_lines < <(tr -d '\r' < "$SYNC_BACKUP_FILE")
+    for ((idx=${#backup_lines[@]}-1; idx>=0; idx--)); do
+        line="${backup_lines[idx]}"; [ -z "$line" ] && continue
+        dev=$(echo "$line" | awk -F'|' '{print $1}')
+        original_mp=$(echo "$line" | awk -F'|' '{print $2}')
+        current_mp=$(echo "$line" | awk -F'|' '{print $3}')
+        original_opts=$(echo "$line" | awk -F'|' '{print $4}')
+        if ! mountpoint -q "$current_mp" 2>/dev/null; then
+            printf "${YELLOW}[!] $dev not at $current_mp. Skipping.${RESET}\n"
+            continue
+        fi
+        printf "${BLUE}[*] Restoring $dev from $current_mp to $original_mp...${RESET}\n"
+        if do_unmount_single "$current_mp" "no"; then
+            mkdir -p "$original_mp"
+            if mount -o "$original_opts" "$dev" "$original_mp" 2>/dev/null; then
+                printf "${GREEN}[✓] Restored.${RESET}\n"
+                remove_from_backup "$dev" "$original_mp"
+            else
+                printf "${RED}[✘] Failed to mount.${RESET}\n"
+            fi
+        else
+            printf "${RED}[✘] Unmount failure.${RESET}\n"
+        fi
+    done
+    clean_empty_dirs
+    [ ! -s "$SYNC_BACKUP_FILE" ] && rm -f "$SYNC_BACKUP_FILE" && printf "${GREEN}[+] All restores completed.${RESET}\n" || printf "${YELLOW}[!] Some backups remain. Run '--usync' again.${RESET}\n"
+}
+
+# --- SESSION UPDATE (mount --move) ---
+do_session_update() {
+    printf "${YELLOW}[*] Scanning active sessions...${RESET}\n"
+    mapfile -t all_session_dirs < <(find "$BASE_MNT" -maxdepth 1 -type d -name "s[0-9]*" 2>/dev/null | sort -V)
+    [ ${#all_session_dirs[@]} -eq 0 ] && { printf "${YELLOW}[!] No session directories.${RESET}\n"; return; }
+    local active_sessions=() inactive_sessions=()
+    for sdir in "${all_session_dirs[@]}"; do
+        sess_num="${sdir##*/s}"
+        if findmnt -rn -o TARGET 2>/dev/null | grep -q "^$sdir/"; then
+            active_sessions+=("$sess_num|$sdir")
+        else
+            inactive_sessions+=("$sess_num|$sdir")
+        fi
+    done
+    [ ${#active_sessions[@]} -eq 0 ] && { printf "${YELLOW}[!] No active sessions.${RESET}\n"; return; }
+    printf "${CYAN}Active: "; for e in "${active_sessions[@]}"; do printf "%s " "${e%|*}"; done
+    printf "\n${YELLOW}Inactive to remove: "; for e in "${inactive_sessions[@]}"; do printf "%s " "${e%|*}"; done; printf "\n"
+    printf "${RED}${BOLD}This will renumber active sessions. Continue? (y/N): ${RESET}"; read -r ans < /dev/tty; echo ""
+    [[ ! "$ans" =~ ^[Yy]$ ]] && { printf "${YELLOW}Aborted.${RESET}\n"; return; }
+    for entry in "${active_sessions[@]}"; do
+        sdir="${entry#*|}"
+        mapfile -t mounts < <(findmnt -rn -o TARGET 2>/dev/null | grep -F "$sdir/")
+        for mp in "${mounts[@]}"; do
+            if ! check_busy "$mp"; then
+                printf "${RED}[!] $mp busy. Abort.${RESET}\n"; return 1
+            fi
+        done
+    done
+    for entry in "${inactive_sessions[@]}"; do
+        old_dir="${entry#*|}"; printf "${RED}[*] Removing $old_dir${RESET}\n"; rm -rf "$old_dir" 2>/dev/null
+        old_num="${entry%|*}"; rm -f "$SESSION_MEMORY_DIR/s_${old_num}.list" 2>/dev/null
+    done
+    mapfile -t sorted_active < <(printf "%s\n" "${active_sessions[@]}" | sort -n)
+    local new_counter=1 renamed=()
+    for entry in "${sorted_active[@]}"; do
+        old_num="${entry%|*}"; old_dir="${entry#*|}"; new_dir="$SESSION_PREFIX$new_counter"; mkdir -p "$new_dir"
+        mapfile -t old_mounts < <(findmnt -rn -o TARGET 2>/dev/null | grep -F "$old_dir/" | awk '{print length($0), $0}' | sort -rn | cut -d' ' -f2-)
+        for old_mp in "${old_mounts[@]}"; do
+            if mountpoint -q "$old_mp" 2>/dev/null; then
+                rel_path="${old_mp#$old_dir/}"; new_mp="$new_dir/$rel_path"; mkdir -p "$(dirname "$new_mp")"
+                mount --move "$old_mp" "$new_mp" 2>/dev/null && printf "${BLUE}[*] Moved: $old_mp -> $new_mp${RESET}\n" || printf "${RED}[!] Move failed.${RESET}\n"
+            fi
+        done
+        [ -f "$SESSION_MEMORY_DIR/s_${old_num}.list" ] && mv "$SESSION_MEMORY_DIR/s_${old_num}.list" "$SESSION_MEMORY_DIR/s_${new_counter}.list" 2>/dev/null && sed -i "s|$SESSION_PREFIX$old_num|$SESSION_PREFIX$new_counter|g" "$SESSION_MEMORY_DIR/s_${new_counter}.list" 2>/dev/null
+        renamed+=("$old_num|$new_counter"); rmdir "$old_dir" 2>/dev/null; ((new_counter++))
+    done
+    [ -f "$SYNC_BACKUP_FILE" ] && for entry in "${renamed[@]}"; do old_num="${entry%|*}"; new_num="${entry#*|}"; sed -i "s|/s$old_num/|/s$new_num/|g" "$SYNC_BACKUP_FILE" 2>/dev/null; done
+    local last_session=$((new_counter-1)); update_session_counter "$last_session"
+    printf "${GREEN}[+] Sessions updated: 1..${last_session}. Next ID: $((last_session+1))${RESET}\n"
+}
+
+# --- SESSION RESTORE (force from user, not from memory) ---
+do_session_restore() {
+    local sess_id="$1" force="${2:-no}"
+    local mem_file="$SESSION_MEMORY_DIR/s_${sess_id}.list"
+    [ ! -f "$mem_file" ] && { printf "${RED}[!] No memory for session $sess_id.${RESET}\n"; return 1; }
+    printf "${YELLOW}[*] Restoring session $sess_id from memory...${RESET}\n"
+    local any_success=0
+    while IFS='|' read -r dev mp; do
+        [ -z "$dev" ] && continue
+        if is_mounted "$dev"; then
+            if [ "$force" = "yes" ]; then
+                printf "${YELLOW}[*] $dev already mounted, forcing restore to $mp...${RESET}\n"
+            else
+                printf "${YELLOW}[!] $dev already mounted. Use -f to force. Skipping.${RESET}\n"
+                continue
+            fi
+        fi
+        mkdir -p "$mp" 2>/dev/null
+        if execute_mount "$dev" "$mp" "$force" "no"; then any_success=1; fi
+    done < "$mem_file"
+    [ $any_success -eq 1 ] && printf "${GREEN}[+] Session $sess_id restored.${RESET}\n" || printf "${YELLOW}[!] No mounts restored.${RESET}\n"
+}
+
+# --- SESSION LIST (show FS, not FORCE) ---
+do_session_list() {
+    local mem_files=("$SESSION_MEMORY_DIR"/s_*.list)
+    [ ! -f "${mem_files[0]}" ] && { printf "${YELLOW}[!] No session memory files.${RESET}\n"; return; }
+    printf "${CYAN}${BOLD}[*] Stored Session Lists:${RESET}\n"
+    for mem in "$SESSION_MEMORY_DIR"/s_*.list; do
+        sess_id=$(basename "$mem" | sed 's/s_//;s/\.list//')
+        printf "\n${PURPLE}${BOLD}  [ Session $sess_id ]${RESET}\n"
+        printf "%-15s %-45s %-10s\n" "DEVICE" "MOUNTPOINT" "FS"
+        echo "$LINE"
+        while IFS='|' read -r dev mp; do
+            [ -z "$dev" ] && continue
+            fs=$(get_fs_type "$dev")
+            [ -z "$fs" ] && fs="unknown"
+            printf "${GREEN}%-15s %-45s %-10s${RESET}\n" "$dev" "$mp" "$fs"
+        done < "$mem"
+    done
+    echo ""
+}
+
+# --- SESSION EXPRESSION PARSER ---
+parse_session_expr() {
+    local expr="$1"
+    expr=$(echo "$expr" | xargs | sed 's/,$//')
+    local re_eq='^=([0-9]+)$' re_gte='^>=([0-9]+)$' re_lte='^<=([0-9]+)$' re_gt='^>([0-9]+)$' re_lt='^<([0-9]+)$' re_ne='^!=([0-9]+)$' re_num='^([0-9]+)$' re_meq='^=([0-9,]+)$' re_mne='^!=([0-9,]+)$'
+    if   [[ "$expr" =~ $re_eq ]]; then echo "=|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_gte ]]; then echo ">=|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_lte ]]; then echo "<=|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_gt ]]; then echo ">|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_lt ]]; then echo "<|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_ne ]]; then echo "!=|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_num ]]; then echo "=|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_meq ]]; then echo "multi=|${BASH_REMATCH[1]}"; return 0
+    elif [[ "$expr" =~ $re_mne ]]; then echo "multi!=|${BASH_REMATCH[1]}"; return 0
+    else return 1; fi
+}
+session_matches() {
+    local sess_num="$1" op="$2" val="$3"
+    case "$op" in
+        "=") [ "$sess_num" -eq "$val" ] ;;
+        ">") [ "$sess_num" -gt "$val" ] ;;
+        "<") [ "$sess_num" -lt "$val" ] ;;
+        ">=") [ "$sess_num" -ge "$val" ] ;;
+        "<=") [ "$sess_num" -le "$val" ] ;;
+        "!=") [ "$sess_num" -ne "$val" ] ;;
+        *) false ;;
+    esac
+}
+unmount_by_session_expr() {
+    local expr="$1" force_lazy="$2"
+    local parsed=$(parse_session_expr "$expr")
+    [ -z "$parsed" ] && { printf "${RED}[!] Invalid expr: $expr${RESET}\n"; return 1; }
+    local op="${parsed%|*}" val="${parsed#*|}"
+    if [ "$op" = "multi=" ]; then
+        IFS=',' read -ra nums <<< "$val"
+        for sdir in "$BASE_MNT"/s[0-9]*; do
+            [ -d "$sdir" ] || continue
+            snum=${sdir##*/s}
+            for n in "${nums[@]}"; do [ "$snum" -eq "$n" ] && do_unmount "" "$snum" "$force_lazy"; done
+        done
+    elif [ "$op" = "multi!=" ]; then
+        IFS=',' read -ra nums <<< "$val"
+        for sdir in "$BASE_MNT"/s[0-9]*; do
+            [ -d "$sdir" ] || continue
+            snum=${sdir##*/s}
+            local exclude=0
+            for n in "${nums[@]}"; do [ "$snum" -eq "$n" ] && exclude=1; done
+            [ $exclude -eq 0 ] && do_unmount "" "$snum" "$force_lazy"
+        done
+    else
+        for sdir in "$BASE_MNT"/s[0-9]*; do
+            [ -d "$sdir" ] || continue
+            snum=${sdir##*/s}
+            session_matches "$snum" "$op" "$val" && do_unmount "" "$snum" "$force_lazy"
+        done
+    fi
+}
+
+# --- HELP ---
+show_help() {
+    printf "${CYAN}${BOLD}"
+    printf "╔══════════════════════════════════════════════════════════╗\n"
+    printf "║          >>>  SADAPTIVE MOUNT MANAGER v1.0  <<<          ║\n"
+    printf "╚══════════════════════════════════════════════════════════╝\n${RESET}\n"
+    printf "  ${BOLD}${GREEN}MAIN COMMANDS:${RESET}\n"
+    printf "    ${YELLOW}-m,  -mount${RESET}  <dev...>      Mount devices with auto-parenting\n"
+    printf "    ${YELLOW}-um, -umount${RESET} <dev|path...> Unmount device, path, or session\n"
+    printf "    ${YELLOW}-c,  -check${RESET}  <target>      Check busy (can combine with -m/-um)\n"
+    printf "    ${YELLOW}-f,  -force${RESET}                Force mount for following devices (bind)\n"
+    printf "    ${YELLOW}-l,  -lazy${RESET}                 Lazy unmount\n"
+    printf "    ${YELLOW}-a,  -all${RESET}                  Apply to ALL partitions\n"
+    printf "\n  ${BOLD}${GREEN}UTILITIES:${RESET}\n"
+    printf "    ${YELLOW}--s, --session${RESET}             Session: <none> (new), =<expr>, -update, -restore=<ID> [-f], -list\n"
+    printf "    ${YELLOW}--t, --target${RESET} <target...>  Custom absolute mountpoints\n"
+    printf "    ${YELLOW}--list${RESET}                     Show mount list (-a for unmounted)\n"
+    printf "    ${YELLOW}--sync${RESET}                     Relocate external mounts to /sadm/ns\n"
+    printf "    ${YELLOW}--usync${RESET}                    Restore from sync backup\n"
+    printf "\n  ${BOLD}${GREEN}EXAMPLES:${RESET}\n"
+    printf "    ${DARK_GRAY}1. Mount devices into new session:${RESET} sadm -m sda sdb --s\n"
+    printf "    ${DARK_GRAY}2. Force mount (bind) to /mnt/extra:${RESET} sadm -m -f sda1 --t /mnt/extra\n"
+    printf "    ${DARK_GRAY}3. Check session 7 activity:${RESET} sadm -c --s=7\n"
+    printf "    ${DARK_GRAY}4. Check before mount:${RESET} sadm -c sda1 -m sda1\n"
+    printf "    ${DARK_GRAY}5. Restore session 3 (force if busy):${RESET} sadm --s-restore=3 -f\n"
+    printf "    ${DARK_GRAY}6. Unmount all except sessions 1,2:${RESET} sadm -um --s!=1,2\n"
+    printf "\n${CYAN}${LINE}${RESET}\n"
+    exit 0
+}
+
+# ====================================================================
+# MAIN PARSING
+# ====================================================================
+
+[ $# -eq 0 ] && show_help
+
+case "$1" in
+    --list) shift; [ "$1" = "-a" ] || [ "$1" = "-all" ] && do_list "-a" || do_list ""; exit 0 ;;
+    --sync) do_sync; exit 0 ;;
+    --usync) do_usync; exit 0 ;;
+    --session-update|--s-update) do_session_update; exit 0 ;;
+    --s-restore=*) sess_id="${1#--s-restore=}"; shift; force_restore="no"; [ "$1" = "-f" ] || [ "$1" = "-force" ] && force_restore="yes"; do_session_restore "$sess_id" "$force_restore"; exit 0 ;;
+    --session-list|--s-list) do_session_list; exit 0 ;;
+esac
+
+mount_args=(); umount_args=(); current_mode=""; check_requested=0; check_target=""
+i=0; args=("$@")
+while [ $i -lt ${#args[@]} ]; do
+    arg="${args[$i]}"
+    case "$arg" in
+        -mount|-m) current_mode="mount"; mount_args+=("$arg"); i=$((i+1)) ;;
+        -umount|-um) current_mode="umount"; umount_args+=("$arg"); i=$((i+1)) ;;
+        -force|-f)
+            if [ "$current_mode" = "mount" ]; then
+                mount_args+=("$arg"); i=$((i+1))
+                while [ $i -lt ${#args[@]} ] && [[ ! "${args[$i]}" =~ ^- ]]; do
+                    mount_args+=("${args[$i]}"); i=$((i+1))
+                done
+            else
+                printf "${RED}[!] -f only with -m${RESET}\n"; exit 1
+            fi ;;
+        -lazy|-l)
+            if [ "$current_mode" = "umount" ]; then
+                umount_args+=("$arg"); i=$((i+1))
+            else
+                printf "${RED}[!] -l only with -um${RESET}\n"; exit 1
+            fi ;;
+        -all|-a)
+            if [ "$current_mode" = "mount" ]; then
+                mount_args+=("$arg")
+            elif [ "$current_mode" = "umount" ]; then
+                umount_args+=("$arg")
+            else
+                printf "${RED}[!] -a after -m or -um${RESET}\n"; exit 1
+            fi
+            i=$((i+1)) ;;
+        --s)
+            if [ "$current_mode" = "mount" ]; then
+                mount_args+=("--s"); i=$((i+1))
+            elif [ "$current_mode" = "umount" ]; then
+                if [ $((i+1)) -lt ${#args[@]} ] && [[ ! "${args[$((i+1))]}" =~ ^- ]]; then
+                    expr="${args[$((i+1))]}"; umount_args+=("--s=$expr"); i=$((i+2))
+                else
+                    printf "${RED}[!] --s in umount requires expression${RESET}\n"; exit 1
+                fi
+            else
+                printf "${RED}[!] --s without -m/-um${RESET}\n"; exit 1
+            fi ;;
+        --s=*|--s\>=*|--s\<=*|--s\>*|--s\<*|--s\!*)
+            if [ "$current_mode" = "umount" ]; then
+                expr="${arg#--s}"; umount_args+=("--s=$expr"); i=$((i+1))
+            else
+                printf "${RED}[!] --s with operator only with -um${RESET}\n"; exit 1
+            fi ;;
+        --t)
+            if [ "$current_mode" = "mount" ]; then
+                mount_args+=("--t"); i=$((i+1))
+                while [ $i -lt ${#args[@]} ] && [[ ! "${args[$i]}" =~ ^- ]]; do
+                    if [[ "${args[$i]}" != /* ]]; then printf "${RED}[!] Target must be absolute.${RESET}\n"; exit 1; fi
+                    mount_args+=("${args[$i]}"); i=$((i+1))
+                done
+            else
+                printf "${RED}[!] --t only with -m${RESET}\n"; exit 1
+            fi ;;
+        -c|-check)
+            check_requested=1; i=$((i+1))
+            if [ $i -lt ${#args[@]} ] && [[ ! "${args[$i]}" =~ ^- ]]; then
+                check_target="${args[$i]}"; i=$((i+1))
+            fi ;;
+        --u|--sync|--usync|--session-update|--s-update|--s-restore=*|--list|--session-list|--s-list)
+            printf "${RED}[!] $arg cannot be combined with -m/-um${RESET}\n"; exit 1 ;;
+        -*)
+            printf "${RED}[!] Unknown flag: $arg${RESET}\n"; exit 1 ;;
+        *)
+            if [ "$current_mode" = "mount" ]; then
+                mount_args+=("$arg")
+            elif [ "$current_mode" = "umount" ]; then
+                umount_args+=("$arg")
+            else
+                printf "${RED}[!] Device without -m/-um: $arg${RESET}\n"; exit 1
+            fi
+            i=$((i+1)) ;;
+    esac
+done
+
+# --- Execute check ---
+if [ $check_requested -eq 1 ]; then
+    check_targets=()
+    if [ -n "$check_target" ]; then
+        check_targets+=("$check_target")
+    else
+        if [ ${#mount_args[@]} -gt 0 ]; then
+            for a in "${mount_args[@]}"; do [[ "$a" != -* ]] && check_targets+=("$a"); done
+        elif [ ${#umount_args[@]} -gt 0 ]; then
+            for a in "${umount_args[@]}"; do [[ "$a" != -* ]] && check_targets+=("$a"); done
+        fi
+    fi
+    if [ ${#check_targets[@]} -eq 0 ]; then
+        printf "${RED}[!] No target for -c${RESET}\n"; exit 1
+    fi
+    for t in "${check_targets[@]}"; do
+        if ! do_check "$t"; then
+            printf "${RED}[✘] Check failed: $t is busy. Aborting.${RESET}\n"; exit 1
+        fi
+    done
+fi
+
+# --- Mount ---
+if [ ${#mount_args[@]} -gt 0 ]; then
+    if [[ "${mount_args[0]}" == -mount || "${mount_args[0]}" == -m ]]; then
+        mount_args=("${mount_args[@]:1}")
+    fi
+    [ ${#mount_args[@]} -gt 0 ] && do_mount "${mount_args[@]}"
+fi
+
+# --- Unmount ---
+if [ ${#umount_args[@]} -gt 0 ]; then
+    lazy_flag="no"; sess_expr=""; all_flag=0; targets=(); i=0
+    while [ $i -lt ${#umount_args[@]} ]; do
+        arg="${umount_args[$i]}"
+        case "$arg" in
+            -umount|-um) i=$((i+1)) ;;
+            -lazy|-l) lazy_flag="yes"; i=$((i+1)) ;;
+            -all|-a) all_flag=1; i=$((i+1)) ;;
+            --s=*) sess_expr="${arg#--s=}"; i=$((i+1)) ;;
+            -*) printf "${RED}[!] Unknown umount flag: $arg${RESET}\n"; exit 1 ;;
+            *) targets+=("$arg"); i=$((i+1)) ;;
+        esac
+    done
+    if [ $all_flag -eq 1 ]; then
+        do_unmount_all
+    elif [ -n "$sess_expr" ]; then
+        unmount_by_session_expr "$sess_expr" "$lazy_flag"
+    elif [ ${#targets[@]} -gt 0 ]; then
+        for target in "${targets[@]}"; do do_unmount "$target" "" "$lazy_flag"; done
+    else
+        printf "${RED}[!] No target for -um${RESET}\n"; exit 1
+    fi
+fi
+
+exit 0

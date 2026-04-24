@@ -1,0 +1,27 @@
+sadm Changelog
+
+[1.0] - 2026-04-24
+------------------
+ADDED:
+  - Initial stable production release (The Keystone Release)
+  - Smart check (`-c`) to detect busy mountpoints and processes before executing any operations
+  - `--session-list` to cleanly display filesystem types and details of stored sessions
+  - Atomic session updating (`--session-update`) using `mount --move` for deadlock-free renumbering
+  - Hierarchical, clean Text User Interface (TUI) with categorized color-coding (System, External, Non-Session, Session)
+
+SECURITY & SAFETY:
+  - Root privilege enforcement at script startup
+  - Hardcoded safety locks to prevent unmounting of core system partitions (`/`, `/boot/efi`)
+  - Integration with `fuser` to instantly abort batch operations if devices are locked by I/O processes
+
+FIXED:
+  - Eliminated extensive `find` directory traversals by utilizing `findmnt` for direct, fast kernel memory reads
+  - Removed `remove_hiberfile` from NTFS mount options to ensure compatibility with modern Linux `ntfs3` drivers
+  - Fixed Bash Boolean inversion bugs during busy state evaluations
+  - Prevented `force` execution state persistence in session memory to avoid Ghost Mounts upon system reboot
+  - Escaped Bash Regex variables to prevent unexpected parser crashes (`unexpected token >`)
+  - Suppressed all unnecessary output and visual garbage (span tags) from UI responses
+
+IMPROVED:
+  - `execute_mount` natively uses `mount --bind` strictly when appropriate to support multiple mountpoints on non-Btrfs filesystems
+  - Combined parameter deducing: `-c` can now dynamically read targets from trailing `-m` or `-um` arguments
