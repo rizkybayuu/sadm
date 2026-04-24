@@ -254,7 +254,7 @@ execute_mount() {
     [ ! -d "$mountpoint" ] && {
         if [ "$interactive_dir_confirm" = "yes" ]; then
             printf "${CYAN}Directory $mountpoint does not exist. Create? (y/N): "
-            local ans=""; read -t 30 -r ans < /dev/tty; echo ""
+            local ans=""; read -t 10 -r ans < /dev/tty; echo ""
             [[ ! "$ans" =~ ^[Yy]$ ]] && { printf "${RED}[✘] Cancelled.${RESET}\n"; return 1; }
         fi
         mkdir -p "$mountpoint" || { printf "${RED}[✘] mkdir failed.${RESET}\n"; return 1; }
@@ -680,8 +680,21 @@ do_session_update() {
         mapfile -t old_mounts < <(findmnt -rn -o TARGET 2>/dev/null | grep -F "$old_dir/" | awk '{print length($0), $0}' | sort -rn | cut -d' ' -f2-)
         for old_mp in "${old_mounts[@]}"; do
             if mountpoint -q "$old_mp" 2>/dev/null; then
+                rel_path="${old_mp#$old_dir/}"
+                new_mp="$new_dir/$rel_path"
+                mkdir -p "$new_mp"   # ← buat direktori target
+                if mount --move "$old_mp" "$new_mp" 2>/dev/null; then
+                    printf "${BLUE}[*] Moved: $old_mp -> $new_mp${RESET}\n"
+                else
+                    printf "${RED}[!] Move failed: $old_mp -> $new_mp${RESET}\n"
+                    return 1   # hentikan update jika gagal
+                fi
+            fi
+        done
+        for old_mp in "${old_mounts[@]}"; do
+            if mountpoint -q "$old_mp" 2>/dev/null; then
                 rel_path="${old_mp#$old_dir/}"; new_mp="$new_dir/$rel_path"; mkdir -p "$(dirname "$new_mp")"
-                mount --move "$old_mp" "$new_mp" 2>/dev/null && printf "${BLUE}[*] Moved: $old_mp -> $new_mp${RESET}\n" || printf "${RED}[!] Move failed.${RESET}\n"
+                mkdir -p "$new_mp" && mount --move "$old_mp" "$new_mp" 2>/dev/null && printf "${BLUE}[*] Moved: $old_mp -> $new_mp${RESET}\n" || printf "${RED}[!] Move failed.${RESET}\n"
             fi
         done
         [ -f "$SESSION_MEMORY_DIR/s_${old_num}.list" ] && mv "$SESSION_MEMORY_DIR/s_${old_num}.list" "$SESSION_MEMORY_DIR/s_${new_counter}.list" 2>/dev/null && sed -i "s|$SESSION_PREFIX$old_num|$SESSION_PREFIX$new_counter|g" "$SESSION_MEMORY_DIR/s_${new_counter}.list" 2>/dev/null
