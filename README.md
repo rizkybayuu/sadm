@@ -54,15 +54,9 @@
 ## Installation
 
 ```bash
-# 1. Install sadp first (optional but recommended for dependency handling)
-curl -fsSL https://raw.githubusercontent.com/rizkybayuu/sadp/main/sadp | \
-  sudo tee /usr/local/sbin/sadp >/dev/null
-sudo chmod +x /usr/local/sbin/sadp
-
-# 2. Install sadm
-curl -fsSL https://raw.githubusercontent.com/rizkybayuu/sadm/main/sadm | \
-  sudo tee /usr/local/sbin/sadm >/dev/null
-sudo chmod +x /usr/local/sbin/sadm
+sudo curl -L -o /usr/local/sbin/sadm \
+  https://raw.githubusercontent.com/rizkybayuu/sadm/main/sadm \
+  && sudo chmod +x /usr/local/sbin/sadm
 ```
 
 ---
